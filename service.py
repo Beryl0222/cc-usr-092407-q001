@@ -125,8 +125,11 @@ def handle_pay(center, body):
     record = center.pay_decision(
         body["decision_id"], actor_id, role,
         amount=body.get("amount"), claim_code=body.get("claim_code"),
-        paid_at=body.get("at"))
-    return 200, record
+        paid_at=body.get("at"), request_id=body.get("request_id"))
+    payload = dict(record)
+    payload["payable_remaining"] = center.decision_balance(
+        record["decision_id"])["payable_amount"]
+    return 200, payload
 
 
 def handle_adjust(center, body):
@@ -134,7 +137,8 @@ def handle_adjust(center, body):
     adj_id = center.adjust_decision(
         body["decision_id"], body["kind"], actor_id, role,
         new_penalty_amount=body.get("new_penalty_amount"),
-        reason=body.get("reason", ""), changed_at=body.get("at"))
+        reason=body.get("reason", ""), changed_at=body.get("at"),
+        request_id=body.get("request_id"))
     adj = center.adjustments[adj_id]
     return 201, {"adjustment_id": adj_id, "status": adj["status"],
                  "old_amount": adj["old_amount"], "new_amount": adj["new_amount"],
@@ -146,7 +150,10 @@ def handle_adjustment_approve(center, body):
     status = center.review_adjustment(
         body["adjustment_id"], actor_id, role,
         approve=bool(body.get("approve", True)))
-    return 200, {"adjustment_id": body["adjustment_id"], "status": status}
+    adj = center.adjustments[body["adjustment_id"]]
+    # 生效时一并返回结算结果：追回 / 取消待付 / 剩余待付，便于财务核对
+    return 200, {"adjustment_id": body["adjustment_id"], "status": status,
+                 "settlement": adj["settlement"]}
 
 
 def handle_adjustment_cosign(center, body):
@@ -154,7 +161,9 @@ def handle_adjustment_cosign(center, body):
     status = center.cosign_adjustment(
         body["adjustment_id"], actor_id, role,
         agree=bool(body.get("agree", True)))
-    return 200, {"adjustment_id": body["adjustment_id"], "status": status}
+    adj = center.adjustments[body["adjustment_id"]]
+    return 200, {"adjustment_id": body["adjustment_id"], "status": status,
+                 "settlement": adj["settlement"]}
 
 
 def handle_commendation(center, body):

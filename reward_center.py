@@ -6,7 +6,10 @@
 - 案件进入可奖励阶段后，按违法类别、举报等级、罚没结果和当时生效的规则版本
   自动生成奖励建议金额（三级物质奖励 + 精神奖励，内部举报加成，百万封顶）；
 - 二十万元以上自动转财政会签，承办人不得批准自己的建议；
-- 撤回、重复举报、行政复议和判决变化一律以追加决定调整，旧结论继续保留。
+- 撤回、重复举报、行政复议和判决变化一律以追加决定调整，旧结论继续保留；
+  追加决定生效时按锁定规则重算应得额：追回以真实已付净额为限，未付差额
+  只取消待付、绝不生成负支付；应得调增部分转为待付，由支付执行人经正常
+  支付流程发放。结算幂等，请求重放与失败恢复不会重复补付或追回。
 
 金额单位为元，一律取整（四舍五入到元）。日期使用 ISO 格式（YYYY-MM-DD），
 按字典序比较即可，不涉及时区。
@@ -422,12 +425,14 @@ class RewardCenter:
                       contribution=contribution or "已撤回")
         return results
 
-    def _first_valid_alias(self, case):
+    def _first_valid_alias(self, case, exclude=None):
         ordered = sorted(
             (self.reports[al] for al in case["aliases"]),
             key=lambda r: (r["received_at"], r["alias"]),
         )
         for report in ordered:
+            if report["alias"] == exclude:
+                continue
             if report["contribution"] == CONTRIBUTION_FIRST:
                 return report["alias"]
         return None
@@ -571,34 +576,34 @@ class RewardCenter:
     # ------------------------------------------------------------------
 
     def pay_decision(self, decision_id, payer_id, actor_role, amount=None,
-                     claim_code=None, paid_at=None):
+                     claim_code=None, paid_at=None, request_id=None):
         """对已生效决定执行支付。
 
-        匿名举报须出示领取码；支付记录只写别名，不写身份。
+        - 支付上限 = 生效应得额（含已生效追加决定）− 实付净额；
+        - 匿名举报须出示领取码；支付记录只写别名，不写身份；
+        - 提供 request_id 时，同一请求重放返回首次支付记录，不重复入账。
         """
         if actor_role != ROLE_PAYER:
             raise PermissionDenied("只有支付执行人可以登记支付")
         d = self._decision(decision_id)
+        if request_id is not None:
+            for p in self.payments:
+                if p.get("request_id") == request_id:
+                    return p  # 请求重放：同一请求只产生一次结果
         if d["status"] != DECISION_EFFECTIVE:
             raise InvalidStateError("只有已生效的决定可以支付")
         report = self.reports[d["alias"]]
         if report["withdrawn"]:
             raise InvalidStateError("举报人已撤回，不得支付")
-        chain = self._adjustment_chain(d)
-        if chain and chain[-1]["status"] in (ADJUST_PENDING_REVIEW,
-                                              ADJUST_PENDING_COSIGN):
+        if self._inflight_adjustment(d):
             raise InvalidStateError("存在在途追加决定，待办结后再支付")
-        # 以已生效追加决定后的金额为支付上限
-        tail = self._tail_adjustment(d)
-        cap_amount = tail["new_amount"] if tail else d["amount"]
-        already = self._paid_amount(decision_id)
+        remaining = self.decision_balance(decision_id)["payable_amount"]
         if report["is_anonymous"]:
             if not claim_code:
                 raise PermissionDenied("匿名举报须凭领取码支付")
             digest = hashlib.sha256(claim_code.encode()).hexdigest()
             if digest != report["claim_code_hash"]:
                 raise PermissionDenied("领取码校验失败")
-        remaining = cap_amount - already
         pay_amount = _round_yuan(amount if amount is not None else remaining)
         if pay_amount <= 0 or pay_amount > remaining:
             raise DomainError(f"可支付余额为 {max(remaining, 0)} 元")
@@ -610,6 +615,8 @@ class RewardCenter:
             "amount": pay_amount,
             "paid_by": payer_id,
             "paid_at": paid_at or self._today(),
+            "note": "支付",
+            "request_id": request_id,
         }
         self.payments.append(record)
         self._log("奖励支付", alias=d["alias"], case_id=d["case_id"],
@@ -617,20 +624,58 @@ class RewardCenter:
         return record
 
     def _paid_amount(self, decision_id):
+        """某决定的实付净额（支付 − 追回）。"""
         return sum(p["amount"] for p in self.payments
                    if p["decision_id"] == decision_id)
+
+    def decision_balance(self, decision_id):
+        """某决定的结算余额：应得 / 已付 / 追回 / 实付净额 / 待付。
+
+        已付只统计真实支付（正向记录），追回单列（负向记录的绝对值），
+        待付 = 应得 − 实付净额，且只在决定已生效时才有待付。
+        """
+        d = self._decision(decision_id)
+        tail = self._tail_adjustment(d)
+        effective = tail["new_amount"] if tail else d["amount"]
+        paid = 0
+        clawed = 0
+        for p in self.payments:
+            if p["decision_id"] != decision_id:
+                continue
+            if p["amount"] >= 0:
+                paid += p["amount"]
+            else:
+                clawed -= p["amount"]
+        net = paid - clawed
+        payable = effective - net if d["status"] == DECISION_EFFECTIVE else 0
+        return {
+            "effective_amount": effective,
+            "paid_total": paid,
+            "clawed_back_total": clawed,
+            "net_paid": net,
+            "payable_amount": max(payable, 0),
+        }
 
     # ------------------------------------------------------------------
     # 7. 追加决定（撤回 / 重复 / 复议 / 判决），旧结论保留
     # ------------------------------------------------------------------
 
     def withdraw_report(self, alias, actor_id, actor_role, withdrawn_at=None):
-        """举报人撤回：标记线索，并对已有决定生成调减为 0 的追加决定。"""
+        """举报人撤回：标记线索，并对已有决定生成调减为 0 的追加决定。
+
+        先校验全部生效决定都不存在在途追加决定，再统一标记撤回，
+        避免部分决定挂上调整、部分遗漏的中间态。
+        """
         if actor_role != ROLE_INTAKE:
             raise PermissionDenied("撤回登记由举报中心办理")
         report = self._report(alias)
         if report["withdrawn"]:
             raise InvalidStateError("该举报已撤回")
+        effective = [d for d in self.decisions.values()
+                     if d["alias"] == alias and d["status"] == DECISION_EFFECTIVE]
+        for d in effective:
+            if self._inflight_adjustment(d):
+                raise InvalidStateError("存在在途追加决定，须先办结才能登记撤回")
         report["withdrawn"] = True
         self._log("举报撤回", alias=alias, case_id=report["case_id"])
         made = []
@@ -645,28 +690,35 @@ class RewardCenter:
             elif d["status"] == DECISION_EFFECTIVE:
                 made.append(self._make_adjustment(
                     d, "withdrawal", 0, "举报人撤回，奖励调减为 0",
-                    proposed_by=actor_id))
+                    proposed_by=actor_id, changed_at=withdrawn_at))
         return made
 
     def adjust_decision(self, decision_id, kind, actor_id, actor_role,
-                        new_penalty_amount=None, reason="", changed_at=None):
+                        new_penalty_amount=None, reason="", changed_at=None,
+                        request_id=None):
         """对生效决定作出追加决定（复议、判决变化、重复确认等）。
 
         - 重算一律使用原决定锁定的规则版本，保证跨生效日的一致性；
         - 原决定不被修改，只标记 superseded_by；
-        - 追加决定同样走审核/会签流程。
+        - 追加决定同样走审核/会签流程；
+        - 提供 request_id 时，同一请求重放返回首次的追加决定，不重复立案。
         """
         if kind not in ADJUST_KINDS:
             raise DomainError(f"不支持的调整类型：{kind}")
         if actor_role != ROLE_HANDLER:
             raise PermissionDenied("追加决定由案件承办人发起")
         d = self._decision(decision_id)
+        if request_id is not None:
+            for a in self.adjustments.values():
+                if a.get("request_id") == request_id:
+                    return a["adjustment_id"]  # 请求重放：只产生一次结果
         if d["status"] != DECISION_EFFECTIVE:
             raise InvalidStateError("只有已生效的决定可以调整")
-        tail = self._tail_adjustment(d)
-        if tail is not None and tail["status"] in (ADJUST_PENDING_REVIEW,
-                                                   ADJUST_PENDING_COSIGN):
+        if self.reports[d["alias"]]["withdrawn"]:
+            raise InvalidStateError("举报已撤回，不再产生新的追加决定")
+        if self._inflight_adjustment(d):
             raise InvalidStateError("该决定已有在途追加决定，须先办结")
+        tail = self._tail_adjustment(d)
         base_amount = tail["new_amount"] if tail is not None else d["amount"]
 
         if kind == "duplicate":
@@ -674,6 +726,8 @@ class RewardCenter:
         elif kind in ("reconsideration", "judgment"):
             if new_penalty_amount is None:
                 raise DomainError("复议或判决变化必须提供新的罚没款金额")
+            if new_penalty_amount < 0:
+                raise DomainError("罚没款金额必须是不小于 0 的数字")
             rule = self._rule_by_version(d["rule_version"])  # 关键：用旧规则重算
             new_amount = self.compute_amount(
                 rule, d["grade"], _round_yuan(new_penalty_amount),
@@ -687,20 +741,20 @@ class RewardCenter:
             note = f"{note}；{reason}" if note else reason
         return self._make_adjustment(d, kind, new_amount, note,
                                      proposed_by=actor_id, changed_at=changed_at,
-                                     base_amount=base_amount)
+                                     base_amount=base_amount,
+                                     request_id=request_id)
 
     def _make_adjustment(self, decision, kind, new_amount, note,
-                         proposed_by, changed_at=None, base_amount=None):
+                         proposed_by, changed_at=None, base_amount=None,
+                         request_id=None):
         rule = self._rule_by_version(decision["rule_version"])
-        chain = self._adjustment_chain(decision)
-        if chain and chain[-1]["status"] in (ADJUST_PENDING_REVIEW,
-                                              ADJUST_PENDING_COSIGN):
+        if self._inflight_adjustment(decision):
             raise InvalidStateError("该决定已有在途追加决定，须先办结")
+        chain = self._adjustment_chain(decision)
         if base_amount is None:
             tail = self._tail_adjustment(decision)
             base_amount = tail["new_amount"] if tail else decision["amount"]
         # 追加决定链：指向上一节点（原决定或上一道追加决定），形成完整沿革
-        chain = self._adjustment_chain(decision)
         prev_id = chain[-1]["adjustment_id"] if chain else None
         adj = {
             "adjustment_id": self._next_id("ADJ", "_adjust_seq"),
@@ -721,6 +775,8 @@ class RewardCenter:
             "reviewed_by": None,
             "cosigned_by": None,
             "created_at": changed_at or self._today(),
+            "request_id": request_id,
+            "settlement": None,  # 生效时写入结算结果，重放直接返回
         }
         self.adjustments[adj["adjustment_id"]] = adj
         # 只在首次被调整时留痕；原决定记录始终保留不删改
@@ -757,6 +813,12 @@ class RewardCenter:
                 tail = adj
         return tail
 
+    def _inflight_adjustment(self, decision):
+        """该决定是否存在在途（待审核/待会签）的追加决定。"""
+        return any(
+            a["status"] in (ADJUST_PENDING_REVIEW, ADJUST_PENDING_COSIGN)
+            for a in self._adjustment_chain(decision))
+
     def review_adjustment(self, adjustment_id, reviewer_id, actor_role, approve=True):
         if actor_role != ROLE_REVIEWER:
             raise PermissionDenied("只有奖励审核人可以审核追加决定")
@@ -768,6 +830,7 @@ class RewardCenter:
         if not approve:
             adj["status"] = ADJUST_REJECTED
             adj["reviewed_by"] = reviewer_id
+            self._on_adjustment_rejected(adj)
             self._log("追加决定驳回", alias=adj["alias"],
                       adjustment_id=adjustment_id)
             return adj["status"]
@@ -791,6 +854,7 @@ class RewardCenter:
         if not agree:
             adj["status"] = ADJUST_REJECTED
             adj["cosigned_by"] = finance_id
+            self._on_adjustment_rejected(adj)
             self._log("追加决定会签退回", alias=adj["alias"],
                       adjustment_id=adjustment_id)
             return adj["status"]
@@ -800,22 +864,74 @@ class RewardCenter:
                   adjustment_id=adjustment_id)
         return adj["status"]
 
+    def _on_adjustment_rejected(self, adj):
+        """追加决定被驳回：旧结论维持；撤回登记随之撤销，举报恢复有效。"""
+        if adj["kind"] == "withdrawal":
+            report = self.reports[adj["alias"]]
+            if report["withdrawn"]:
+                report["withdrawn"] = False
+                self._log("撤回未获认可，举报恢复有效", alias=adj["alias"],
+                          case_id=adj["case_id"])
+
     def _effect_adjustment(self, adj):
+        """追加决定生效：状态流转 + 资金结算（幂等，重放不产生二次结果）。"""
+        if adj["status"] == ADJUST_EFFECTIVE:
+            return adj["settlement"]
         adj["status"] = ADJUST_EFFECTIVE
-        delta = adj["delta"]
-        if delta != 0:
-            # 正向为补付，负向为追回（金额记负）
+        report = self.reports[adj["alias"]]
+        if adj["kind"] == "withdrawal":
+            report["withdrawn"] = True
+        elif adj["kind"] == "duplicate":
+            # 重复确认生效后，举报人不再具备奖励资格
+            report["contribution"] = CONTRIBUTION_DUPLICATE
+            report["grade"] = None
+            if not report["duplicate_of"]:
+                report["duplicate_of"] = self._first_valid_alias(
+                    self.cases[adj["case_id"]], exclude=adj["alias"])
+        return self._settle_adjustment(adj)
+
+    def _settle_adjustment(self, adj):
+        """追加决定生效时的资金结算（幂等）。
+
+        结算边界：
+        - 应得额已按锁定规则重算（new_amount）；
+        - 实付净额超过新应得额的部分登记追回（负向资金记录），
+          追回以真实已付为限；
+        - 未付差额只取消待付，不生成负支付；
+        - 应得调增部分转为待付，由支付执行人经正常支付流程发放，
+          系统不替支付执行人把未付款记成已付。
+        结算结果保存在追加决定上，重复生效、请求重放或失败恢复
+        都直接返回既有结果，不会重复补付或追回。
+        """
+        if adj["settlement"] is not None:
+            return adj["settlement"]
+        net_paid = self._paid_amount(adj["decision_id"])
+        payable_before = max(0, adj["old_amount"] - net_paid)
+        clawback = max(0, net_paid - adj["new_amount"])
+        if clawback > 0:
             self.payments.append({
                 "payment_id": f"P-{len(self.payments) + 1:04d}",
                 "decision_id": adj["decision_id"],
                 "adjustment_id": adj["adjustment_id"],
                 "alias": adj["alias"],
                 "case_id": adj["case_id"],
-                "amount": delta,
+                "amount": -clawback,
                 "paid_by": "system-adjustment",
                 "paid_at": self._today(),
-                "note": "补付" if delta > 0 else "追回",
+                "note": "追回",
             })
+            self._log("奖励追回", alias=adj["alias"], case_id=adj["case_id"],
+                      adjustment_id=adj["adjustment_id"], amount=clawback)
+        net_after = net_paid - clawback
+        payable_after = max(0, adj["new_amount"] - net_after)
+        adj["settlement"] = {
+            "effective_amount": adj["new_amount"],
+            "clawed_back": clawback,
+            "cancelled_payable": max(0, payable_before - payable_after),
+            "net_paid": net_after,
+            "payable_amount": payable_after,
+        }
+        return adj["settlement"]
 
     # ------------------------------------------------------------------
     # 8. 精神奖励（与物质奖励并行）
@@ -900,12 +1016,18 @@ class RewardCenter:
                                 "stage": PENDING_LABELS[a["status"]],
                                 "proposed_amount": a["new_amount"]})
 
-        paid = sum(p["amount"] for p in self.payments
-                   if p["alias"] == alias and p["case_id"] == case["case_id"])
-        tail = self._tail_adjustment(current) if current else None
-        effective_amount = None
+        # 资金台账分列：应得 / 已付 / 追回 / 待付 / 仍待处理，互不混记
         if current is not None:
-            effective_amount = tail["new_amount"] if tail else current["amount"]
+            balance = self.decision_balance(current["decision_id"])
+            effective_amount = balance["effective_amount"]
+        else:
+            balance = {"paid_total": 0, "clawed_back_total": 0,
+                       "net_paid": 0, "payable_amount": 0}
+            effective_amount = None
+        history = sorted(
+            (p for p in self.payments
+             if p["alias"] == alias and p["case_id"] == case["case_id"]),
+            key=lambda p: p["payment_id"])
         commendations = [c for c in self.commendations.values()
                          if c["alias"] == alias]
 
@@ -925,6 +1047,11 @@ class RewardCenter:
                     "rule_version": current["rule_version"],
                 }),
             "effective_amount": effective_amount,
+            "paid_total": balance["paid_total"],
+            "clawed_back_total": balance["clawed_back_total"],
+            "net_paid": balance["net_paid"],
+            "payable_amount": balance["payable_amount"],
+            "pending_amount": sum(item["proposed_amount"] for item in pending),
             "adjustments": [{
                 "adjustment_id": a["adjustment_id"],
                 "kind_label": a["kind_label"],
@@ -932,9 +1059,17 @@ class RewardCenter:
                 "new_amount": a["new_amount"],
                 "status": a["status"],
                 "reason": a["reason"],
+                "settlement": a["settlement"],
             } for a in adjustments],
             "pending_approvals": pending,
-            "paid_total": paid,
+            "payment_history": [{
+                "payment_id": p["payment_id"],
+                "amount": p["amount"],
+                "kind": p.get("note") or ("支付" if p["amount"] > 0 else "追回"),
+                "paid_by": p["paid_by"],
+                "paid_at": p["paid_at"],
+                "adjustment_id": p.get("adjustment_id"),
+            } for p in history],
             "commendations": [
                 {"level": c["level"], "granted_at": c["granted_at"]}
                 for c in commendations],

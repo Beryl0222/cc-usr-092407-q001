@@ -20,7 +20,14 @@
 - **规则版本锁定**：案件进入可奖励阶段时锁定当时生效的规则；之后的行政复议、
   判决变化即使跨越规则生效日，也按锁定版本重算。
 - **只追加调整**：撤回、重复确认、复议、判决变化均产生追加决定，原决定原样保留；
-  追加决定同样走审核（及必要时会签），生效后自动补付或追回，驳回则旧结论维持。
+  追加决定同样走审核（及必要时会签），驳回则旧结论维持（撤回类驳回同时恢复
+  举报有效状态）。
+- **结算边界**：追加决定生效时按锁定规则重算应得额。追回以真实已付净额为限；
+  未付差额只取消待付，绝不生成负支付；应得调增部分转为待付，由支付执行人经
+  正常支付流程发放（匿名仍须领取码），系统不把未付款记成已付。
+- **幂等执行**：结算结果随追加决定保存，重复生效、请求重放、失败恢复都不会
+  重复补付或追回；支付与追加决定接口支持 `request_id`，同一请求重放只产生
+  一次结果。历史决定与每笔资金动作（支付/追回）均留痕可追溯。
 - **匿名支付**：匿名举报生成一次性领取码，支付时校验，业务记录仍只写别名。
 
 规则版本与系数集中在 `reward_center.py` 的 `DEFAULT_RULES`（当前含 2023-01、
@@ -42,13 +49,13 @@
 | `POST /rewards/propose` | 按规则自动生成奖励建议（禁止手填金额） |
 | `POST /rewards/approve` | 奖励审核（拒绝自审） |
 | `POST /rewards/cosign` | 财政会签（仅 ≥ 20 万元时需要） |
-| `POST /rewards/pay` | 支付（匿名须带 `claim_code`） |
-| `POST /rewards/adjust` | 追加决定：withdrawal/duplicate/reconsideration/judgment |
-| `POST /rewards/adjustment/approve` | 追加决定审核 |
-| `POST /rewards/adjustment/cosign` | 追加决定会签 |
+| `POST /rewards/pay` | 支付（匿名须带 `claim_code`；支持 `request_id` 重放保护） |
+| `POST /rewards/adjust` | 追加决定：withdrawal/duplicate/reconsideration/judgment（支持 `request_id`） |
+| `POST /rewards/adjustment/approve` | 追加决定审核（生效时返回结算结果） |
+| `POST /rewards/adjustment/cosign` | 追加决定会签（生效时返回结算结果） |
 | `POST /commendations` | 登记精神奖励 |
 | `POST /identity/reveal` | 查看真实身份（受限且留痕） |
-| `GET /cases/{id}/explain` | 逐人说明：资格/待办审批/实际支付/调整沿革 |
+| `GET /cases/{id}/explain` | 逐人说明：资格/应得/待付/已付/追回/仍待处理/资金动作 |
 | `GET /cases/{id}/file` | 承办人办案视图（仅别名） |
 | `GET /cases/{id}/public` | 对外材料 |
 | `GET /cases/{id}/log` | 普通办案日志 |
@@ -60,7 +67,7 @@
 python3 -m compileall -q reward_center.py service.py service_contract.py test_http_flows.py test_reward_center.py
 python3 service.py --check   # 规则与服务自检
 python3 service.py --port 8000
-npm test                     # 契约 + 领域规则 + HTTP 端到端，共 33 项
+npm test                     # 契约 + 领域规则 + HTTP 端到端，共 51 项
 ```
 
 `fixtures/domain.json` 保存领域名词与状态样例，便于接口联调时保持一致语义。
