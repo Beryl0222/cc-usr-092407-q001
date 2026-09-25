@@ -20,7 +20,12 @@
 - **规则版本锁定**：案件进入可奖励阶段时锁定当时生效的规则；之后的行政复议、
   判决变化即使跨越规则生效日，也按锁定版本重算。
 - **只追加调整**：撤回、重复确认、复议、判决变化均产生追加决定，原决定原样保留；
-  追加决定同样走审核（及必要时会签），生效后自动补付或追回，驳回则旧结论维持。
+  追加决定同样走审核（及必要时会签），生效后自动结算，驳回则旧结论维持。
+- **结算边界**：追加决定生效时按锁定规则重算应得额，但资金动作只动真实已付：
+  调增自动补付差额；调减时追回以“净实付超出新应得”的部分为限，
+  未付差额记“取消待付”（0 元台账条目），绝不产生负支付。
+- **请求幂等**：支付、撤回、追加决定可带 `request_id`；同一请求重放只产生一次
+  结果，失败恢复不会重复补付或追回。`request_id` 不得跨接口复用（409）。
 - **匿名支付**：匿名举报生成一次性领取码，支付时校验，业务记录仍只写别名。
 
 规则版本与系数集中在 `reward_center.py` 的 `DEFAULT_RULES`（当前含 2023-01、
@@ -48,7 +53,7 @@
 | `POST /rewards/adjustment/cosign` | 追加决定会签 |
 | `POST /commendations` | 登记精神奖励 |
 | `POST /identity/reveal` | 查看真实身份（受限且留痕） |
-| `GET /cases/{id}/explain` | 逐人说明：资格/待办审批/实际支付/调整沿革 |
+| `GET /cases/{id}/explain` | 逐人说明：资格/待办审批/应得/待付/已付/补付/追回/取消待付/调整沿革 |
 | `GET /cases/{id}/file` | 承办人办案视图（仅别名） |
 | `GET /cases/{id}/public` | 对外材料 |
 | `GET /cases/{id}/log` | 普通办案日志 |
@@ -60,7 +65,7 @@
 python3 -m compileall -q reward_center.py service.py service_contract.py test_http_flows.py test_reward_center.py
 python3 service.py --check   # 规则与服务自检
 python3 service.py --port 8000
-npm test                     # 契约 + 领域规则 + HTTP 端到端，共 33 项
+npm test                     # 契约 + 领域规则 + HTTP 端到端，共 46 项
 ```
 
 `fixtures/domain.json` 保存领域名词与状态样例，便于接口联调时保持一致语义。

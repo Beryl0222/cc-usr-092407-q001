@@ -33,11 +33,16 @@ def health_payload():
 # 全局单例；联调场景足够，正式部署应替换为依赖注入的持久化实现
 CENTER = RewardCenter()
 
+# HTTP 层请求重放缓存：(method, path, request_id) -> (status, payload)
+# 同一请求重放只执行一次，直接返回首个结果；进程内实现，随 reset_center 清空。
+_REQUEST_CACHE = {}
+
 
 def reset_center(today=None):
     """重置进程内状态（仅供测试/联调初始化使用）。"""
     global CENTER
     CENTER = RewardCenter(today=today)
+    _REQUEST_CACHE.clear()
     return CENTER
 
 
@@ -74,7 +79,8 @@ def handle_supplement(center, body):
 def handle_withdraw(center, body):
     actor_id, role = _actor(body)
     ids = center.withdraw_report(body["alias"], actor_id, role,
-                                 withdrawn_at=body.get("at"))
+                                 withdrawn_at=body.get("at"),
+                                 request_id=body.get("request_id"))
     return 200, {"alias": body["alias"], "adjustments": ids}
 
 
@@ -125,7 +131,7 @@ def handle_pay(center, body):
     record = center.pay_decision(
         body["decision_id"], actor_id, role,
         amount=body.get("amount"), claim_code=body.get("claim_code"),
-        paid_at=body.get("at"))
+        paid_at=body.get("at"), request_id=body.get("request_id"))
     return 200, record
 
 
@@ -134,11 +140,21 @@ def handle_adjust(center, body):
     adj_id = center.adjust_decision(
         body["decision_id"], body["kind"], actor_id, role,
         new_penalty_amount=body.get("new_penalty_amount"),
-        reason=body.get("reason", ""), changed_at=body.get("at"))
+        reason=body.get("reason", ""), changed_at=body.get("at"),
+        request_id=body.get("request_id"))
     adj = center.adjustments[adj_id]
     return 201, {"adjustment_id": adj_id, "status": adj["status"],
                  "old_amount": adj["old_amount"], "new_amount": adj["new_amount"],
                  "needs_cosign": adj["needs_cosign"]}
+
+
+def _adjustment_payload(center, adjustment_id, status):
+    """追加决定审批/会签后的统一返回：状态 + 已生效时的资金结算明细。"""
+    adj = center.adjustments[adjustment_id]
+    payload = {"adjustment_id": adjustment_id, "status": status}
+    if adj.get("settlement"):
+        payload["settlement"] = adj["settlement"]
+    return 200, payload
 
 
 def handle_adjustment_approve(center, body):
@@ -146,7 +162,7 @@ def handle_adjustment_approve(center, body):
     status = center.review_adjustment(
         body["adjustment_id"], actor_id, role,
         approve=bool(body.get("approve", True)))
-    return 200, {"adjustment_id": body["adjustment_id"], "status": status}
+    return _adjustment_payload(center, body["adjustment_id"], status)
 
 
 def handle_adjustment_cosign(center, body):
@@ -154,7 +170,7 @@ def handle_adjustment_cosign(center, body):
     status = center.cosign_adjustment(
         body["adjustment_id"], actor_id, role,
         agree=bool(body.get("agree", True)))
-    return 200, {"adjustment_id": body["adjustment_id"], "status": status}
+    return _adjustment_payload(center, body["adjustment_id"], status)
 
 
 def handle_commendation(center, body):
@@ -264,6 +280,20 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, UnicodeDecodeError):
             self._send_json(400, {"error": "请求体不是合法 JSON"})
             return
+        # 幂等：带 request_id 的请求重放时直接返回首个执行结果
+        request_id = body.get("request_id") if isinstance(body, dict) else None
+        cache_key = ("POST", parsed.path, request_id) if request_id else None
+        if request_id:
+            for (method, path, rid), (status, payload) in _REQUEST_CACHE.items():
+                if rid == request_id and (method, path) != ("POST", parsed.path):
+                    self._send_json(409, {
+                        "error": f"request_id {request_id} 已用于 {path}，"
+                                 "不能跨接口复用"})
+                    return
+            if cache_key in _REQUEST_CACHE:
+                status, payload = _REQUEST_CACHE[cache_key]
+                self._send_json(status, payload)
+                return
         try:
             status, payload = handler(CENTER, body)
         except DomainError as exc:
@@ -272,6 +302,8 @@ class Handler(BaseHTTPRequestHandler):
         except (KeyError, TypeError) as exc:
             self._send_json(400, {"error": f"缺少或错误的参数：{exc}"})
             return
+        if cache_key is not None:
+            _REQUEST_CACHE[cache_key] = (status, payload)
         self._send_json(status, payload)
 
     def _domain_error(self, exc):

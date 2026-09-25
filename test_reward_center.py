@@ -196,6 +196,45 @@ class ThreeReportersTest(unittest.TestCase):
         self.assertEqual(explained[self.a2]["paid_total"], 0)
 
 
+    def test_adjustment_isolates_each_reporter_settlement(self):
+        """多名举报人：对一人的调整不影响其他人的应得/待付/已付。"""
+        self._assess()
+        decisions = settle(self.c, self.case, [
+            {"alias": self.a1, "grade": 1},
+            {"alias": self.a2, "grade": 1, "duplicate": True},
+            {"alias": self.a3, "grade": 2, "key_contribution": True},
+        ])
+        did1 = decisions[self.a1]["decision_id"]
+        did3 = decisions[self.a3]["decision_id"]
+        # a1 部分付款 10 万，a3 全额付款 20 万
+        self.c.pay_decision(did1, "payer-1", PAYER, amount=100_000,
+                            claim_code=self.code1)
+        self.c.pay_decision(did3, "payer-1", PAYER, claim_code=self.code3)
+        # a1 复议调减：400 万罚没 -> 2026 版一级 6% = 24 万（仍需会签）
+        adj_id = self.c.adjust_decision(
+            did1, "reconsideration", "handler-1", HANDLER,
+            new_penalty_amount=4_000_000, changed_at="2026-06-01")
+        self.assertTrue(self.c.adjustments[adj_id]["needs_cosign"])
+        self.c.review_adjustment(adj_id, "reviewer-2", REVIEWER)
+        self.c.cosign_adjustment(adj_id, "finance-2", FINANCE)
+
+        explained = {r["alias"]: r for r in
+                     self.c.explain_case(self.case)["reporters"]}
+        p1, p3 = explained[self.a1], explained[self.a3]
+        # a1：调减 6 万，已付 10 万未超新应得，不追回，差额取消待付
+        self.assertEqual(p1["effective_amount"], 240_000)
+        self.assertEqual(p1["paid_total"], 100_000)
+        self.assertEqual(p1["clawback_total"], 0)
+        self.assertEqual(p1["cancelled_total"], 60_000)
+        self.assertEqual(p1["payable_total"], 140_000)
+        # a3 完全不受影响
+        self.assertEqual(p3["effective_amount"], 200_000)
+        self.assertEqual(p3["paid_total"], 200_000)
+        self.assertEqual(p3["clawback_total"], 0)
+        self.assertEqual(p3["cancelled_total"], 0)
+        self.assertEqual(p3["payable_total"], 0)
+
+
 class NoPenaltyCaseTest(unittest.TestCase):
     def setUp(self):
         self.c = make_center()
@@ -461,6 +500,203 @@ class CommendationAndSupplementsTest(unittest.TestCase):
         self.assertEqual(view["reports"][0]["supplements"][0]["facts"],
                          ["补充证据1", "补充证据2"])
         self.assertNotIn("identity", json.dumps(view, ensure_ascii=False))
+
+
+class SettlementBoundaryTest(unittest.TestCase):
+    """结算边界：追回只冲减真实已付，未付差额取消待付，绝不产生负支付。"""
+
+    def setUp(self):
+        self.c = make_center()
+        self.alias, self.case, _ = intake(
+            self.c, "食品药品安全", ["事实A"], "2025-11-01",
+            identity={"name": "王五"})
+        self.c.close_case(self.case, 5_000_000, closed_at="2025-12-10")
+        self.c.enter_reward_stage(self.case, entered_at="2025-12-15")
+        decisions = settle(self.c, self.case, [
+            {"alias": self.alias, "grade": 1, "new_facts": ["事实A"]}])
+        self.did = decisions[self.alias]["decision_id"]
+        # 2023 版一级：500 万 × 5% = 25 万（已会签生效，尚未支付）
+        self.assertEqual(self.c.decisions[self.did]["amount"], 250_000)
+
+    def _negative_payments(self):
+        return [p for p in self.c.payments if p["amount"] < 0]
+
+    def _person(self):
+        return self.c.explain_case(self.case)["reporters"][0]
+
+    def _settle_adjustment(self, adj_id, finance=False):
+        self.c.review_adjustment(adj_id, "reviewer-2", REVIEWER)
+        if finance:
+            self.c.cosign_adjustment(adj_id, "finance-2", FINANCE)
+        return self.c.adjustments[adj_id]["settlement"]
+
+    def test_unpaid_decision_adjusted_down_cancels_payable_no_negative(self):
+        # 未付款即复议调减：25 万 -> 15 万
+        adj_id = self.c.adjust_decision(
+            self.did, "reconsideration", "handler-1", HANDLER,
+            new_penalty_amount=3_000_000, changed_at="2026-03-01")
+        result = self._settle_adjustment(adj_id)
+        # 没有真实已付，追回为 0；10 万差额记取消待付
+        self.assertEqual(result["clawback"], 0)
+        self.assertEqual(result["cancelled"], 100_000)
+        self.assertEqual(result["supplement"], 0)
+        self.assertEqual(self._negative_payments(), [])
+
+        person = self._person()
+        self.assertEqual(person["effective_amount"], 150_000)
+        self.assertEqual(person["paid_total"], 0)
+        self.assertEqual(person["payable_total"], 150_000)
+        self.assertEqual(person["cancelled_total"], 100_000)
+        self.assertEqual(person["clawback_total"], 0)
+
+        # 调整后按新应得支付，支付后结清
+        self.c.pay_decision(self.did, "payer-1", PAYER)
+        person = self._person()
+        self.assertEqual(person["paid_total"], 150_000)
+        self.assertEqual(person["payable_total"], 0)
+
+    def test_partial_payment_down_adjust_never_claws_back_more_than_paid(self):
+        # 部分付款 10 万后复议调减到 15 万：已付未超新应得，不追回
+        self.c.pay_decision(self.did, "payer-1", PAYER, amount=100_000)
+        adj_id = self.c.adjust_decision(
+            self.did, "reconsideration", "handler-1", HANDLER,
+            new_penalty_amount=3_000_000, changed_at="2026-03-01")
+        result = self._settle_adjustment(adj_id)
+        self.assertEqual(result["clawback"], 0)
+        self.assertEqual(result["cancelled"], 100_000)
+        self.assertEqual(self._negative_payments(), [])
+        person = self._person()
+        self.assertEqual(person["paid_total"], 100_000)
+        self.assertEqual(person["payable_total"], 50_000)
+
+        # 再次复议调减到 8 万：只追回真实多付的 2 万，其余 5 万取消待付
+        adj2 = self.c.adjust_decision(
+            self.did, "judgment", "handler-1", HANDLER,
+            new_penalty_amount=1_600_000, changed_at="2026-04-01")
+        result2 = self._settle_adjustment(adj2)
+        self.assertEqual(result2["clawback"], 20_000)
+        self.assertEqual(result2["cancelled"], 50_000)
+        person = self._person()
+        self.assertEqual(person["effective_amount"], 80_000)
+        self.assertEqual(person["paid_total"], 80_000)
+        self.assertEqual(person["clawback_total"], 20_000)
+        self.assertEqual(person["cancelled_total"], 150_000)
+        self.assertEqual(person["payable_total"], 0)
+        # 追回记录金额为负且仅此一条，总额不超过真实已付
+        negatives = self._negative_payments()
+        self.assertEqual(len(negatives), 1)
+        self.assertEqual(negatives[0]["amount"], -20_000)
+        self.assertEqual(negatives[0]["kind"], "clawback")
+
+    def test_unpaid_withdrawal_cancels_payable_without_negative_payment(self):
+        self.c.withdraw_report(self.alias, "intake-1", INTAKE)
+        adj_id = next(iter(self.c.adjustments))
+        result = self._settle_adjustment(adj_id)
+        self.assertEqual(result["clawback"], 0)
+        self.assertEqual(result["cancelled"], 250_000)
+        self.assertEqual(self._negative_payments(), [])
+        person = self._person()
+        self.assertEqual(person["effective_amount"], 0)
+        self.assertEqual(person["paid_total"], 0)
+        self.assertEqual(person["payable_total"], 0)
+        self.assertEqual(person["cancelled_total"], 250_000)
+
+    def test_paid_withdrawal_claws_back_exactly_paid_amount(self):
+        self.c.pay_decision(self.did, "payer-1", PAYER)
+        self.c.withdraw_report(self.alias, "intake-1", INTAKE)
+        adj_id = next(iter(self.c.adjustments))
+        result = self._settle_adjustment(adj_id)
+        self.assertEqual(result["clawback"], 250_000)
+        self.assertEqual(result["cancelled"], 0)
+        person = self._person()
+        self.assertEqual(person["paid_total"], 0)
+        self.assertEqual(person["clawback_total"], 250_000)
+
+    def test_upward_adjustment_supplements_once_and_requires_cosign(self):
+        self.c.pay_decision(self.did, "payer-1", PAYER)
+        # 判决变化调增：罚没 500 万 -> 600 万，2023 版 5% = 30 万，
+        # 超过会签线，追加决定也需会签
+        adj_id = self.c.adjust_decision(
+            self.did, "judgment", "handler-1", HANDLER,
+            new_penalty_amount=6_000_000, changed_at="2026-04-01")
+        adj = self.c.adjustments[adj_id]
+        self.assertEqual(adj["new_amount"], 300_000)
+        self.assertTrue(adj["needs_cosign"])
+        self.c.review_adjustment(adj_id, "reviewer-2", REVIEWER)
+        self.assertEqual(self.c.adjustments[adj_id]["status"], "待调整会签")
+        # 会签前不补付
+        self.assertEqual(self._person()["paid_total"], 250_000)
+        self.c.cosign_adjustment(adj_id, "finance-2", FINANCE)
+        result = self.c.adjustments[adj_id]["settlement"]
+        self.assertEqual(result["supplement"], 50_000)
+        self.assertEqual(result["clawback"], 0)
+        person = self._person()
+        self.assertEqual(person["paid_total"], 300_000)
+        self.assertEqual(person["supplement_total"], 50_000)
+        self.assertEqual(person["payable_total"], 0)
+        # 失败恢复重入不重复补付
+        self.c._effect_adjustment(self.c.adjustments[adj_id])
+        self.assertEqual(self._person()["paid_total"], 300_000)
+        self.assertEqual(
+            len([p for p in self.c.payments if p["kind"] == "supplement"]), 1)
+
+    def test_effect_adjustment_is_idempotent_on_recovery(self):
+        adj_id = self.c.adjust_decision(
+            self.did, "reconsideration", "handler-1", HANDLER,
+            new_penalty_amount=3_000_000, changed_at="2026-03-01")
+        self._settle_adjustment(adj_id)
+        before = list(self.c.payments)
+        # 失败恢复重入：重复生效同一追加决定不产生重复资金动作
+        again = self.c._effect_adjustment(self.c.adjustments[adj_id])
+        self.assertEqual(again["cancelled"], 100_000)
+        self.assertEqual(self.c.payments, before)
+
+
+class IdempotencyTest(unittest.TestCase):
+    """同一请求重放只产生一次结果。"""
+
+    def setUp(self):
+        self.c = make_center()
+        self.alias, self.case, _ = intake(
+            self.c, "价格违法", ["事实A"], "2026-02-01",
+            identity={"name": "赵六"})
+        self.c.close_case(self.case, 1_000_000)
+        self.c.enter_reward_stage(self.case)
+        self.c.assess_contributions(self.case, [
+            {"alias": self.alias, "grade": 2, "new_facts": ["事实A"]}
+        ], "intake-1", INTAKE)
+        self.did = self.c.propose_rewards(self.case, "handler-1", HANDLER)[0]
+        self.c.approve_decision(self.did, "reviewer-1", REVIEWER)
+
+    def test_pay_replay_with_same_request_id_pays_once(self):
+        r1 = self.c.pay_decision(self.did, "payer-1", PAYER,
+                                 request_id="pay-001")
+        r2 = self.c.pay_decision(self.did, "payer-1", PAYER,
+                                 request_id="pay-001")
+        self.assertEqual(r1["payment_id"], r2["payment_id"])
+        self.assertEqual(len(self.c.payments), 1)
+        # 不同 request_id 的重复支付仍受余额约束（已全额支付，余额为 0）
+        with self.assertRaises(DomainError):
+            self.c.pay_decision(self.did, "payer-1", PAYER,
+                                request_id="pay-002")
+
+    def test_adjust_replay_creates_single_adjustment(self):
+        a1 = self.c.adjust_decision(
+            self.did, "duplicate", "handler-1", HANDLER,
+            request_id="adj-001")
+        a2 = self.c.adjust_decision(
+            self.did, "duplicate", "handler-1", HANDLER,
+            request_id="adj-001")
+        self.assertEqual(a1, a2)
+        self.assertEqual(len(self.c.adjustments), 1)
+
+    def test_withdraw_replay_creates_single_adjustment(self):
+        w1 = self.c.withdraw_report(self.alias, "intake-1", INTAKE,
+                                    request_id="wd-001")
+        w2 = self.c.withdraw_report(self.alias, "intake-1", INTAKE,
+                                    request_id="wd-001")
+        self.assertEqual(w1, w2)
+        self.assertEqual(len(self.c.adjustments), 1)
 
 
 if __name__ == "__main__":

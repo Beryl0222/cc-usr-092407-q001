@@ -249,6 +249,153 @@ class HttpFlowTest(unittest.TestCase):
             urlopen(req, timeout=2)
         self.assertEqual(error.exception.code, 400)
 
+    # ------------------------------------------------------------------
+    # 结算边界与幂等
+
+    def _effective_decision(self, penalty=5_000_000, stage_at="2025-12-15"):
+        """造一笔已生效决定（2023 版一级，25 万），返回 (alias, case_id, did)。"""
+        _, body = self.post("/reports/intake", {
+            "actor": actor("intake-1", "intake_officer"),
+            "violation_category": "食品药品安全",
+            "facts": ["事实A"], "received_at": "2025-11-01",
+            "identity": {"name": "王某"}})
+        alias, case_id = body["alias"], body["case_id"]
+        self.post("/cases/close", {
+            "case_id": case_id, "penalty_amount": penalty, "at": "2025-12-10"})
+        self.post("/cases/reward-stage", {"case_id": case_id, "at": stage_at})
+        self.post("/cases/assess", {
+            "actor": actor("intake-1", "intake_officer"),
+            "case_id": case_id,
+            "assessments": [{"alias": alias, "grade": 1,
+                             "new_facts": ["事实A"]}]})
+        _, proposed = self.post("/rewards/propose", {
+            "actor": actor("handler-1", "case_handler"), "case_id": case_id})
+        did = proposed["decision_ids"][0]
+        self.post("/rewards/approve", {
+            "actor": actor("reviewer-1", "reward_reviewer"),
+            "decision_id": did})
+        self.post("/rewards/cosign", {
+            "actor": actor("finance-1", "finance_cosigner"),
+            "decision_id": did})
+        return alias, case_id, did
+
+    def test_unpaid_adjustment_cancels_payable_no_negative_payment(self):
+        """未付款的决定被复议调减：取消待付而不是制造负支付。"""
+        alias, case_id, did = self._effective_decision()
+
+        status, adj = self.post("/rewards/adjust", {
+            "actor": actor("handler-1", "case_handler"),
+            "decision_id": did, "kind": "reconsideration",
+            "new_penalty_amount": 3_000_000, "at": "2026-03-01"})
+        self.assertEqual(status, 201)
+        self.assertEqual(adj["new_amount"], 150_000)
+
+        status, approved = self.post("/rewards/adjustment/approve", {
+            "actor": actor("reviewer-2", "reward_reviewer"),
+            "adjustment_id": adj["adjustment_id"]})
+        self.assertEqual(status, 200)
+        self.assertEqual(approved["status"], "已生效")
+        # 审批响应直接给出结算明细：无追回，10 万差额取消待付
+        self.assertEqual(approved["settlement"],
+                         {"supplement": 0, "clawback": 0,
+                          "cancelled": 100_000, "moves": ["P-0001"]})
+
+        _, explain = self.get(f"/cases/{case_id}/explain")
+        person = explain["reporters"][0]
+        self.assertEqual(person["effective_amount"], 150_000)
+        self.assertEqual(person["paid_total"], 0)
+        self.assertEqual(person["payable_total"], 150_000)
+        self.assertEqual(person["cancelled_total"], 100_000)
+        self.assertEqual(person["clawback_total"], 0)
+        self.assertEqual(person["pending_balance"], 0)
+
+        # 取消待付只是 0 元台账条目；之后按新应得正常支付
+        status, paid = self.post("/rewards/pay", {
+            "actor": actor("payer-1", "payment_officer"),
+            "decision_id": did})
+        self.assertEqual(status, 200)
+        self.assertEqual(paid["amount"], 150_000)
+        _, explain = self.get(f"/cases/{case_id}/explain")
+        person = explain["reporters"][0]
+        self.assertEqual(person["paid_total"], 150_000)
+        self.assertEqual(person["payable_total"], 0)
+
+    def test_partial_payment_then_downward_adjustments_over_http(self):
+        """部分付款后连续调减：追回以真实已付为限。"""
+        alias, case_id, did = self._effective_decision()
+        # 先付 10 万（部分付款）
+        status, paid = self.post("/rewards/pay", {
+            "actor": actor("payer-1", "payment_officer"),
+            "decision_id": did, "amount": 100_000})
+        self.assertEqual(status, 200)
+        self.assertEqual(paid["amount"], 100_000)
+
+        # 第一次调减到 15 万：已付未超新应得，不追回，取消 10 万待付
+        _, adj1 = self.post("/rewards/adjust", {
+            "actor": actor("handler-1", "case_handler"),
+            "decision_id": did, "kind": "reconsideration",
+            "new_penalty_amount": 3_000_000, "at": "2026-03-01"})
+        _, approved1 = self.post("/rewards/adjustment/approve", {
+            "actor": actor("reviewer-2", "reward_reviewer"),
+            "adjustment_id": adj1["adjustment_id"]})
+        self.assertEqual(approved1["settlement"]["clawback"], 0)
+        self.assertEqual(approved1["settlement"]["cancelled"], 100_000)
+
+        # 第二次调减到 8 万：只追回真实多付的 2 万
+        _, adj2 = self.post("/rewards/adjust", {
+            "actor": actor("handler-1", "case_handler"),
+            "decision_id": did, "kind": "judgment",
+            "new_penalty_amount": 1_600_000, "at": "2026-04-01"})
+        _, approved2 = self.post("/rewards/adjustment/approve", {
+            "actor": actor("reviewer-2", "reward_reviewer"),
+            "adjustment_id": adj2["adjustment_id"]})
+        self.assertEqual(approved2["settlement"]["clawback"], 20_000)
+        self.assertEqual(approved2["settlement"]["cancelled"], 50_000)
+
+        _, explain = self.get(f"/cases/{case_id}/explain")
+        person = explain["reporters"][0]
+        self.assertEqual(person["effective_amount"], 80_000)
+        self.assertEqual(person["paid_total"], 80_000)
+        self.assertEqual(person["clawback_total"], 20_000)
+        self.assertEqual(person["cancelled_total"], 150_000)
+        self.assertEqual(person["payable_total"], 0)
+        # 调整沿革完整可追溯
+        self.assertEqual([a["kind_label"] for a in person["adjustments"]],
+                         ["行政复议变化", "司法判决变化"])
+
+    def test_request_replay_only_settles_once_over_http(self):
+        """同一 request_id 重放：支付与追加决定只产生一次结果。"""
+        alias, case_id, did = self._effective_decision()
+
+        # 支付重放
+        payload = {"actor": actor("payer-1", "payment_officer"),
+                   "decision_id": did, "amount": 100_000,
+                   "request_id": "pay-req-1"}
+        _, first = self.post("/rewards/pay", payload)
+        _, second = self.post("/rewards/pay", payload)
+        self.assertEqual(first["payment_id"], second["payment_id"])
+
+        # 追加决定重放
+        adj_payload = {"actor": actor("handler-1", "case_handler"),
+                       "decision_id": did, "kind": "reconsideration",
+                       "new_penalty_amount": 3_000_000, "at": "2026-03-01",
+                       "request_id": "adj-req-1"}
+        _, a1 = self.post("/rewards/adjust", adj_payload)
+        _, a2 = self.post("/rewards/adjust", adj_payload)
+        self.assertEqual(a1["adjustment_id"], a2["adjustment_id"])
+
+        _, explain = self.get(f"/cases/{case_id}/explain")
+        person = explain["reporters"][0]
+        self.assertEqual(person["paid_total"], 100_000)
+        self.assertEqual(len(person["adjustments"]), 1)
+
+        # request_id 不能跨接口复用
+        status, _ = self.post("/rewards/pay", {
+            "actor": actor("payer-1", "payment_officer"),
+            "decision_id": did, "amount": 1000,
+            "request_id": "adj-req-1"})
+        self.assertEqual(status, 409)
+
 
 if __name__ == "__main__":
     unittest.main()
